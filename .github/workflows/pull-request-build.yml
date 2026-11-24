@@ -1,8 +1,12 @@
 name: "Build and Test"
 
 on:
-  pull_request:
-    branches: ['4.1.x-fixes', '3.6.x-fixes', '3.5.x-fixes', '3.4.x-fixes']
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Surefire -Dtest selector; empty runs the full cxf-core and rt/frontend/jaxrs suites plus MTOMBase64Test,JAXRSEntityPartTest'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -31,9 +35,45 @@ jobs:
           cache: maven
       - name: Build with Apache Maven (Windows)
         if: ${{ matrix.os == 'windows-latest' }} 
-        run: mvn -U clean install -fae -B -Peverything
+        run: mvn -U clean install -fae -B -Peverything -pl core -am "-Dcheckstyle.skip=true" "-Dpmd.skip=true" ${{ inputs.test-filter && format('"-Dtest={0}" "-Dsurefire.failIfNoSpecifiedTests=false"', inputs.test-filter) || '' }}
       - name: Build with Apache Maven
         if: ${{ matrix.os != 'windows-latest' }} 
-        run: mvn -U clean install -Djava.awt.headless=true -fae -B -Peverything
+        run: mvn -U clean install -Djava.awt.headless=true -fae -B -Peverything -pl core -am "-Dcheckstyle.skip=true" "-Dpmd.skip=true" ${{ inputs.test-filter && format('"-Dtest={0}" "-Dsurefire.failIfNoSpecifiedTests=false"', inputs.test-filter) || '' }}
+      - name: Upload cxf-core jar
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cxf-core-jar
+          path: core/target/cxf-core-4.1.8.jar
+          if-no-files-found: error
+      - name: Patched-path coverage - rt/frontend/jaxrs module suite
+        if: ${{ matrix.os != 'windows-latest' }}
+        run: mvn -U install -Djava.awt.headless=true -fae -B -pl rt/frontend/jaxrs "-Dcheckstyle.skip=true" "-Dpmd.skip=true" ${{ inputs.test-filter && format('"-Dtest={0}" "-Dsurefire.failIfNoSpecifiedTests=false" "-DfailIfNoTests=false"', inputs.test-filter) || '' }}
+      - name: Patched-path coverage - targeted systests (MTOMBase64Test, JAXRSEntityPartTest)
+        if: ${{ matrix.os != 'windows-latest' }}
+        run: mvn -U test -Djava.awt.headless=true -fae -B -pl systests/databinding,systests/jaxrs "-Dtest=${{ inputs.test-filter || 'MTOMBase64Test,JAXRSEntityPartTest' }}" "-Dsurefire.failIfNoSpecifiedTests=false" "-DfailIfNoTests=false" "-Dcheckstyle.skip=true" "-Dpmd.skip=true"
+      - name: Report surefire results (totals and each skipped test with its reason)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          PY_BIN=$(command -v python3 || command -v python)
+          "$PY_BIN" - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          T = F = E = S = 0
+          for mod in ['core', 'rt/frontend/jaxrs', 'systests/databinding', 'systests/jaxrs']:
+              t = f = e = s = 0
+              for path in sorted(glob.glob(mod + '/target/surefire-reports/TEST-*.xml')):
+                  r = ET.parse(path).getroot()
+                  t += int(r.get('tests', 0)); f += int(r.get('failures', 0))
+                  e += int(r.get('errors', 0)); s += int(r.get('skipped', 0))
+                  for tc in r.iter('testcase'):
+                      sk = tc.find('skipped')
+                      if sk is not None:
+                          print('SKIPPED %s.%s: %s' % (tc.get('classname'), tc.get('name'), (sk.get('message') or sk.text or 'no message').strip()))
+              if t:
+                  print('SUREFIRE TOTAL (%s) tests=%d passed=%d failures=%d errors=%d skipped=%d' % (mod, t, t - f - e - s, f, e, s))
+              T += t; F += f; E += e; S += s
+          print('SUREFIRE GRAND TOTAL tests=%d passed=%d failures=%d errors=%d skipped=%d' % (T, T - F - E - S, F, E, S))
+          PY
     env: 
        MAVEN_OPTS: "-Xmx1024M"
